@@ -6,6 +6,7 @@ import gurobipy as gp
 from gurobipy import Model, GRB
 import cvxpy as cp
 
+from utils import save_N, load_N, save_V, load_V
 from data import EnergyData
 from std_modeling import StdModel
 
@@ -13,6 +14,17 @@ from std_modeling import StdModel
 将清华大学分区建模为三个能量枢纽， 对各能量枢纽内的设备进行选型，规划，
 分析清华大学在未来碳中和下能源利用方式
 """
+# =============================================================================================
+# ==================================  data preparing ==========================================
+# =============================================================================================
+# init data
+CARBON_MAX = 10e4
+CARBON_PER_GAS = 0.0021650  # tCO_2/m^3
+GAS2MWH = 100 # 1 m^3 = 0.01 MWH
+UNMET_PENALTY = 50e4 # 失负荷惩罚 50万元/MWh
+CARBON_PENALTY = 200 # CO2排放惩罚 200/tCO2
+
+
 # load data
 data_loader = EnergyData(path="../data")
 data_loader = data_loader.get_2d_array().get_8760()
@@ -57,11 +69,12 @@ N_tch = cp.Variable(std_model_tch.node_num, integer=True, name='device number in
 N_pv = cp.Variable(1, integer=True, name='pv number')
 N_wt = cp.Variable(1, integer=True, name='wt number')
 
-assert N_stu.shape == std_model_stu.Pbase.shape and N_off.shape == std_model_off.Pbase.shape \
+assert N_stu.shape == std_model_stu.Pbase[:-1].shape and N_off.shape == std_model_off.Pbase[:-1].shape \
         and N_tch.shape == std_model_tch.Pbase.shape
+# 学生区和教学办公区，暂时不包括光伏和风机
 # element-wise multiply, 每个设备的功率容量
-device_stu_max = cp.multiply(N_stu, std_model_stu.Pbase)
-device_off_max = cp.multiply(N_off, std_model_off.Pbase)
+device_stu_max = cp.multiply(N_stu, std_model_stu.Pbase[:-1])
+device_off_max = cp.multiply(N_off, std_model_off.Pbase[:-1])
 device_tch_max = cp.multiply(N_tch, std_model_tch.Pbase)
 
 # element-wise multiply, 每个储能的能量容量 (3,)
@@ -73,23 +86,20 @@ V_stu_max = cp.Variable(V_stu.shape, name='V stu max') # (25, 8760)
 V_off_max = cp.Variable(V_off.shape, name='V off max') # (29, 8760)
 V_tch_max = cp.Variable(V_tch.shape, name='V tch max') # (37, 8760)
 
-
 # (2, 8760)电热输入 (4, 8760)
-V_stu_in, V_stu_out = X_stu @ V_stu_no_storage, Y_stu @ V_stu_no_storage
+V_stu_in_no_storage, V_stu_out = X_stu @ V_stu_no_storage, Y_stu @ V_stu_no_storage
 # (2, 8760)电气输入 (3, 8760)
-V_off_in, V_off_out = X_off @ V_off_no_storage, Y_off @ V_off_no_storage
+V_off_in_no_storage, V_off_out = X_off @ V_off_no_storage, Y_off @ V_off_no_storage
 # (3, 8760)电气热输入 (3, 8760)
-V_tch_in, V_tch_out = X_tch @ V_tch_no_storage, Y_tch @ V_tch_no_storage
-
+V_tch_in_no_storage, V_tch_out = X_tch @ V_tch_no_storage, Y_tch @ V_tch_no_storage
 
 ## 增加储能后！！！
 # (5, 8760)
-V_stu_in_storage = cp.vstack([V_stu_in, V_stu[-3:,:]])
-V_off_in_storage = cp.vstack([V_off_in, V_off[-3:,:]])
-V_tch_in_storage = cp.vstack([V_tch_in, V_tch[-3:,:]])
+V_stu_in = cp.vstack([V_stu_in_no_storage, V_stu[-3:,:]])
+V_off_in = cp.vstack([V_off_in_no_storage, V_off[-3:,:]])
+V_tch_in = cp.vstack([V_tch_in_no_storage, V_tch[-3:,:]])
 
 # print(f"V_stu_in_storage {V_stu_in_storage.shape}")
-
 VB_stu, VF_stu = V_stu_no_storage[pivot_idx_stu, :], V_stu_no_storage[nonpivot_idx_stu, :]
 VB_off, VF_off = V_off_no_storage[pivot_idx_off, :], V_off_no_storage[nonpivot_idx_off, :]
 VB_tch, VF_tch = V_tch_no_storage[pivot_idx_tch, :], V_tch_no_storage[nonpivot_idx_tch, :]
@@ -103,9 +113,9 @@ VF_tch_min, VF_tch_max = np.zeros(VF_tch.shape), V_tch_max[nonpivot_idx_tch]
 
 # Cin (4, 5)
 # CF (4, 13)
-V_gen_stu = Cin_stu @ V_stu_in_storage + CF_stu @ VF_stu # (4, 8760) 气输出，而非负荷
-V_gen_off = Cin_off @ V_off_in_storage + CF_off @ VF_off # (3, 8760) 电热冷，没有气输出
-V_gen_tch = Cin_tch @ V_tch_in_storage + CF_tch @ VF_tch # (3, 8760)
+V_gen_stu = Cin_stu @ V_stu_in + CF_stu @ VF_stu # (4, 8760) 气输出，而非负荷
+V_gen_off = Cin_off @ V_off_in + CF_off @ VF_off # (3, 8760) 电热冷，没有气产出
+V_gen_tch = Cin_tch @ V_tch_in + CF_tch @ VF_tch # (3, 8760) 电热冷，没有气产出
 
 V_gen_for_load_stu = cp.Variable((4, 8760), name='Vout for load in stu')
 V_gen_for_out_stu = cp.Variable((4, 8760), name='Vout for out in stu')
@@ -122,12 +132,16 @@ ele_stu_purchased = cp.Variable(8760, name='purchased power in stu')
 ele_off_purchased = cp.Variable(8760, name='purchased power in off')
 ele_tch_purchased = cp.Variable(8760, name='purchased power in tch')
 ele_purchased = cp.Variable(8760, name='purchased power total')
-
-ele_stu2off = cp.Variable(8760, name='power stu to off')
-ele_stu2tch = cp.Variable(8760, name='power stu to tch')
-ele_off2tch = cp.Variable(8760, name='power off to tch')
+ele_stu2off = cp.Variable(8760, name='power from stu to off')
+ele_stu2tch = cp.Variable(8760, name='power from stu to tch')
+ele_off2tch = cp.Variable(8760, name='power from off to tch')
 gas_purchased = cp.Variable(8760, name='purchased gas')
 
+pv_max = N_pv * data_loader.supply_pv_8760
+wt_max = N_wt * data_loader.supply_wt_8760
+
+pv_stu_in = cp.Variable(8760, name='PV power in stu')
+wt_off_in = cp.Variable(8760, name='WT power in off')
 
 # =============================================================================================
 # ================================= Create Constraints ========================================
@@ -155,10 +169,6 @@ constraints += [
     V_stu_max[7,:] <= cp.multiply(device_stu_max[4], hrs),
     V_stu_max[8,:] <= cp.multiply(device_stu_max[4], hrs),
     V_stu_max[9,:] <= cp.multiply(device_stu_max[4], hrs),
-    # V_stu_max[6,:] == cp.minimum(cp.multiply(device_stu_max[0], hrs), cp.multiply(device_stu_max[4], hrs)),
-    # V_stu_max[7,:] == cp.minimum(cp.multiply(device_stu_max[1], hrs), cp.multiply(device_stu_max[4], hrs)),
-    # V_stu_max[8,:] == cp.minimum(cp.multiply(device_stu_max[2], hrs), cp.multiply(device_stu_max[4], hrs)),
-    # V_stu_max[9,:] == cp.minimum(cp.multiply(device_stu_max[3], hrs), cp.multiply(device_stu_max[4], hrs)),
     V_stu_max[10,:] == cp.multiply(device_stu_max[4], hrs),
     #6 储热输入限制
     V_stu_max[13,:] == cp.multiply(device_stu_max[5], hrs),
@@ -242,9 +252,6 @@ constraints += [
     V_tch_max[16,:] == cp.multiply(device_tch_max[5], hrs),
     V_tch_max[17,:] <= cp.multiply(device_tch_max[5], hrs),
     V_tch_max[18,:] <= cp.multiply(device_tch_max[5], hrs),
-
-    # V_tch_max[17,:] == cp.minimum(V_tch_max[17,:], cp.multiply(device_tch_max[5], hrs)),
-    # V_tch_max[18,:] == cp.minimum(V_tch_max[18,:], cp.multiply(device_tch_max[5], hrs)),
     #7 储热输入功率限制
     V_tch_max[23,:] == cp.multiply(device_tch_max[6], hrs),
     V_tch_max[26,:] == cp.multiply(device_tch_max[6], hrs),
@@ -262,31 +269,42 @@ constraints += [
     V_tch_max[36,:] == cp.multiply(device_tch_max[7], hrs),
 ]
 
-
 ## 分区能源枢纽约束
 constraints += [
+    # 储能外支路功率约束
     VF_stu_min <= VF_stu, VF_off_min <= VF_off, VF_tch_min <= VF_tch,
     VF_stu <= VF_stu_max, VF_off <= VF_off_max, VF_tch <= VF_tch_max,
     VB_stu_min <= VB_stu, VB_off_min <= VB_off, VB_tch_min <= VB_tch,
     VB_stu <= VB_stu_max, VB_off <= VB_off_max, VB_tch <= VB_tch_max,
-    VB_stu == -QB_stu_inv @ QF_stu @ VF_stu - QB_stu_inv @ R_stu @ V_stu_in_storage,
-    VB_off == -QB_off_inv @ QF_off @ VF_off - QB_off_inv @ R_off @ V_off_in_storage,
-    VB_tch == -QB_tch_inv @ QF_tch @ VF_tch - QB_tch_inv @ R_tch @ V_tch_in_storage,
+
+    # VB与VF之间的等式约束
+    VB_stu == - QB_stu_inv @ QF_stu @ VF_stu - QB_stu_inv @ R_stu @ V_stu_in,
+    VB_off == - QB_off_inv @ QF_off @ VF_off - QB_off_inv @ R_off @ V_off_in,
+    VB_tch == - QB_tch_inv @ QF_tch @ VF_tch - QB_tch_inv @ R_tch @ V_tch_in,
+
+    # 储能虚拟支路功率约束，注意这里充放电可正可负
+    -V_stu_max[-3:] <= V_stu_storage, V_stu_storage <= V_stu_max[-3:],
+    -V_off_max[-3:] <= V_off_storage, V_off_storage <= V_off_max[-3:],
+    -V_tch_max[-3:] <= V_tch_storage, V_tch_storage <= V_tch_max[-3:],
 ]
+
 
 ## 负荷与输出约束
 constraints += [
     # 电气热
     # 学生区输出拆分(4, 8760) 电气热冷
     V_gen_stu == V_gen_for_load_stu + V_gen_for_out_stu,
+    0 <= V_gen_stu, 0 <= V_gen_for_load_stu, 0 <= V_gen_for_out_stu,
     V_gen_for_load_stu[1,:] == 0, # 本身没有气负荷
     V_gen_for_out_stu[2,:] == 0, # 没有热输出
     V_gen_for_out_stu[3,:] == 0, # 没有冷输出
     # 教学办公区输出拆分(3, 8760) 电热冷，没有产生气
     V_gen_off == V_gen_for_load_off + V_gen_for_out_off,
+    0 <= V_gen_off, 0 <= V_gen_for_load_off, 0 <= V_gen_for_out_off,
     V_gen_for_out_off[2,:] == 0, # 没有冷输出
     # 教工区没有输出 (3, 8760) 电热冷，没有产生气
     V_gen_tch == V_gen_for_load_tch + V_gen_for_out_tch,
+    0 <= V_gen_tch, 0 <= V_gen_for_load_tch, 0 <= V_gen_for_out_tch,
     V_gen_for_out_tch == 0, # 没有任何输出
     # 负荷约束
     V_gen_for_load_stu[[0,2,3],:] <= V_load_stu,
@@ -301,27 +319,38 @@ for day in range(365):
         cur_hour = 24*day + hour
         constraints += [
             # SOC 上下限
-            # 0 <= SOC_stu, SOC_stu <= 1, 0 <= SOC_off, SOC_off <= 1, 0 <= SOC_tch, SOC_tch <= 1,
             0 <= es_stu[:,cur_hour], es_stu[:,cur_hour]<= es_stu_max,
             0 <= es_off[:,cur_hour], es_off[:,cur_hour]<= es_off_max,
             0 <= es_tch[:,cur_hour], es_tch[:,cur_hour]<= es_tch_max,
-
-            # 储能日内平衡
-            # SOC_stu[:,24*day] == 0.5, SOC_off[:,24*day] == 0.5, SOC_tch[:,24*day] == 0.5,
-            es_stu[:,24*day] == cp.multiply(0.5, es_stu_max), 
-            es_off[:,24*day] == cp.multiply(0.5, es_off_max), 
-            es_tch[:,24*day] == cp.multiply(0.5, es_tch_max), 
-
-            # 储能递推约束
-            es_stu[:,cur_hour+1] == es_stu[:,cur_hour] + V_stu_storage[:,cur_hour],
-            es_off[:,cur_hour+1] == es_off[:,cur_hour] + V_off_storage[:,cur_hour],
-            es_tch[:,cur_hour+1] == es_tch[:,cur_hour] + V_tch_storage[:,cur_hour],
         ]
+        # 储能递推约束
+        if hour == 23:
+            constraints += [
+                # 储能递推约束
+                es_stu[:,cur_hour-23] == es_stu[:,cur_hour] + V_stu_storage[:,cur_hour],
+                es_off[:,cur_hour-23] == es_off[:,cur_hour] + V_off_storage[:,cur_hour],
+                es_tch[:,cur_hour-23] == es_tch[:,cur_hour] + V_tch_storage[:,cur_hour],
+            ]
+        else:
+            constraints += [
+                # 储能递推约束
+                es_stu[:,cur_hour+1] == es_stu[:,cur_hour] + V_stu_storage[:,cur_hour],
+                es_off[:,cur_hour+1] == es_off[:,cur_hour] + V_off_storage[:,cur_hour],
+                es_tch[:,cur_hour+1] == es_tch[:,cur_hour] + V_tch_storage[:,cur_hour],
+            ]
 
-pv_stu_in = N_pv * data_loader.supply_pv_8760
-wt_off_in = N_wt * data_loader.supply_wt_8760
 ## 母线平衡
 constraints += [
+    # 风光约束
+    0 <= pv_stu_in, pv_stu_in <= pv_max, 0 <= wt_off_in, wt_off_in <= wt_max, 
+    # 购电、购气约束
+    0 <= ele_stu_purchased, 0 <= ele_off_purchased, 0 <= ele_tch_purchased,
+    0 <= ele_purchased, 0 <= gas_purchased,
+    ## 母线平衡
+    # V_stu_in 电热输入+3储能， V_stu_out 电气热冷
+    # V_off_in 电气输入+3储能， V_off_out 电热冷
+    # V_tch_in 电气热输入+3储能，V_tch_out 电热冷
+
     # 电母线平衡
     ele_stu_purchased + V_gen_for_out_stu[0,:] + pv_stu_in == V_stu_in[0,:] + ele_stu2off + ele_stu2tch,
     ele_off_purchased + ele_stu2off + V_gen_for_out_off[0,:] + wt_off_in == V_off_in[0,:] + ele_off2tch,
@@ -333,77 +362,72 @@ constraints += [
     V_gen_for_out_off[1,:] == V_stu_in[1,:] + V_tch_in[2,:] 
 ]
 
-#%%
 # =============================================================================================
 # ===================================== object funtion ========================================
 # =============================================================================================
 # C_total = C_cap + C_op + C_carbon
 
 ## C_cap 建设成本
-
-C_cap_stu = std_model_stu.compute_C_cap(N_stu, N_pv)
-C_cap_off = std_model_stu.compute_C_cap(N_off, N_wt)
-C_cap_tch = std_model_stu.compute_C_cap(N_tch)
+C_cap_stu, _ = std_model_stu.compute_C_cap(N_stu, N_pv)
+C_cap_off, _ = std_model_off.compute_C_cap(N_off, N_wt)
+C_cap_tch, _ = std_model_tch.compute_C_cap(N_tch)
 
 C_cap = C_cap_stu + C_cap_off + C_cap_tch
 
-# 电-热-冷 失负荷矩阵
+## C_op 运行成本
 unmet_stu = cp.sum(V_load_stu - V_gen_for_load_stu[[0,2,3],:])
 unmet_off = cp.sum(V_load_off - V_gen_for_load_off)
 unmet_tch = cp.sum(V_load_tch - V_gen_for_load_tch)
-unmet = unmet_stu + unmet_off + unmet_tch
+unmet = unmet_stu + unmet_off + unmet_tch # 总失负荷 MWh
 
-
+C_unmet = UNMET_PENALTY * unmet
 C_ele = data_loader.price_electricity_8760 @ ele_purchased
-C_gas = data_loader.price_gas_8760 @ gas_purchased
-C_unmet = 50e4 * unmet
+C_gas = data_loader.price_gas_8760 @ gas_purchased * GAS2MWH
 C_op = C_ele + C_gas + C_unmet
 
-carbon = ele_purchased @ data_loader.carbon_factor_8760 + gas_purchased * 0.0021650 # tCO2
+## C_carbon 碳排放成本
+carbon = ele_purchased @ data_loader.carbon_factor_8760 + gas_purchased * GAS2MWH * CARBON_PER_GAS # tCO2
 carbon_exceed = cp.Variable()
-
 constraints += [
-    carbon_exceed >= cp.sum(carbon) - 3e5,
+    carbon_exceed >= cp.sum(carbon) - CARBON_MAX,
     carbon_exceed >= 0,
 ]
+C_carbon = CARBON_PENALTY * carbon_exceed
 
-C_carbon = 200*carbon_exceed
-    
+## C_total 最终目标函数
 C_total = C_cap + C_op + C_carbon
-
 
 if __name__ == '__main__':
     obj = cp.Minimize(C_total)
     problem = cp.Problem(obj, constraints)
-    problem.solve(verbose=True, solver=cp.GUROBI)
+    # 设置Gurobi的method参数
+    solver_options = {"Method": 3}  
+    # -1 表示默认方法，3 表示非确定性并发，4 表示确定性并发
+
+    # 解决问题
+    problem.solve(verbose=True, solver=cp.GUROBI, solver_opts=solver_options)
+    # problem.solve(verbose=True, solver=cp.GUROBI)
 
     status = problem.status
     print(f"Problem Status: {status}")
 
     print(f"The optimal value is {problem.value}")
 
+    print(f"C_total {C_total.value} = C_cap {C_cap.value} + C_op {C_op.value} + C_carbon {C_carbon.value}")
+    print(f"C_cap {C_cap.value} = C_cap_stu {C_cap_stu.value} + C_cap_off {C_cap_off.value} + C_cap_tch {C_cap_tch.value}")
+    print(f"C_op {C_op.value} = C_ele {C_ele.value} + C_gas {C_gas.value} + C_unmet {C_unmet.value}")
+
+    print(f"总失负荷： {unmet.value}")
+
+    print(f"C_carbon {C_carbon.value} = CARBON_PENALTY {CARBON_PENALTY} * carbon_exceed {carbon_exceed.value}")
+
+    print(f"总碳排放：{sum(carbon.value)}, 超限 {carbon_exceed.value}")
+
     V_stu, V_off, V_tch = V_stu.value, V_off.value, V_tch.value
     N_stu, N_off, N_tch, N_pv, N_wt = N_stu.value, N_off.value, N_tch.value, N_pv.value, N_wt.value
 
-    print(f"V_stu: {V_stu}")
-    print(f"V_off: {V_off}")
-    print(f"V_tch: {V_tch}")
-
-    
-    print(f"N_stu: {N_stu}")
-    print(f"N_off: {N_off}")
-    print(f"N_tch: {N_tch}")
-    print(f"N_pv: {N_pv}")
-    print(f"N_wt: {N_wt}")
-
-    np.save('V_stu.npy', V_stu)
-    np.save('V_off.npy', V_off)
-    np.save('V_tch.npy', V_tch)
-    np.save('N_stu.npy', N_stu)
-    np.save('N_off.npy', N_off)
-    np.save('N_tch.npy', N_tch)
-    np.save('N_pv.npy', N_pv)
-    np.save('N_wt.npy', N_wt)
+    save_N(N_stu, N_off, N_tch, N_pv, N_wt)
+    save_V(V_stu, V_off, V_tch)
 
 
 

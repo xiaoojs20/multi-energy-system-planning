@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
-from utils import *
+from utils import rref
 
 class StdModel(object):
     def __init__(self, path='../data', region=''):
@@ -15,18 +15,23 @@ class StdModel(object):
         self.gamma = 0.04 # 贴现率
         self.region = region
         if self.region == 'stu':
+            self.devic_name = ['压缩式制冷机组A', '电制气', '电锅炉', '地源热泵B', '储电', '储热', '蓄冷', '分布式光伏']
             self.ttl = np.array([10,10,20,20,10,20,20,20])
-            self.cost = np.array([40,10,60,350,400*2,9*5,9*5,700])
-            self.Pbase = np.array([0.5,0.5,2,10,1,8,8])
+            self.Pbase = np.array([0.5,0.5,2,10,1,8,8,1])
+            self.cost = np.array([40,10,60,350,400*2,9*5,9*5,700]) * 1e4 # 元！
+            self.cost_per_device = self.cost * self.Pbase # 元！
         elif self.region == 'off':
+            self.devic_name = ['热电联产机组A', '吸收式制冷机组', '冷热电联供', '燃气蒸汽锅炉', '储电', '储热', '蓄冷', '风机']
             self.ttl = np.array([30,20,30,30,10,20,20,20])
-            self.cost = np.array([850,60,400,40,400*2,9*5,9*5,700])
-            self.Pbase = np.array([2,12,3,2,1,8,8])
+            self.Pbase = np.array([2,12,3,2,1,8,8,1])
+            self.cost = np.array([850,60,400,40,400*2,9*5,9*5,700]) * 1e4 # 元！
+            self.cost_per_device = self.cost * self.Pbase # 元！
         elif self.region == 'tch':
+            self.devic_name = ['热电联产机组B', '地源热泵A', '压缩式制冷机组B', '燃气轮机', '内燃机', '储电', '储热', '蓄冷']
             self.ttl = np.array([30,20,20,20,20,10,20,20])
-            self.cost = np.array([790,380,60,60,400*2,9*5,9*5,9])
             self.Pbase = np.array([8,2,12,5,10,1,8,8])
-    
+            self.cost = np.array([790,380,60,60,400*2,9*5,9*5,9]) * 1e4 # 元！
+            self.cost_per_device = self.cost * self.Pbase # 元！
     def get_in_out_branch(self, node:int):
         # 以node为终点的支路表in_branch，和以node为起点的支路表out_branch
         in_branch = self.branch_table[self.branch_table['sink']==node]
@@ -188,7 +193,7 @@ class StdModel(object):
         # print(Y)
         # indices_1 = np.where(Y == 1)
         # print("输出端口 ", list(zip(indices_1[0], indices_1[1]+1)))
-        self.Y = Y
+        # self.Y = Y
         return Y
     
     def get_R(self, es):
@@ -248,6 +253,7 @@ class StdModel(object):
 
     def compute_C_cap(self, N1, N2=None):
         C_cap = 0
+        C_cap_list = [] 
         # 等年值折算方法
         if N2 is not None:
             # print(N1.shape[0] + N2.shape[0] , len(self.cost))
@@ -257,12 +263,16 @@ class StdModel(object):
             assert N1.shape[0] == len(self.cost)
 
         for i in range(N1.shape[0]):    
-            C_cap += ( self.gamma / (1-(1+self.gamma)**(self.ttl[i])) ) * self.cost[i] * N1[i]
+            C_cap_i = ( self.gamma / (1-(1+self.gamma)**(-self.ttl[i])) ) * self.cost_per_device[i] * N1[i]
+            C_cap += C_cap_i
+            C_cap_list.append(C_cap_i)
         if N2 is not None:
             # 加上风机或光伏
-            C_cap += ( self.gamma / (1-(1+self.gamma)**(self.ttl[-1])) ) * self.cost[-1] * N2
+            C_cap_i = ( self.gamma / (1-(1+self.gamma)**(-self.ttl[-1])) ) * self.cost_per_device[-1] * N2
+            C_cap += C_cap_i
+            C_cap_list.append(C_cap_i)
+        return C_cap, C_cap_list
 
-        return C_cap
 
 if __name__ == '__main__':
     # 验证标准化建模
@@ -279,10 +289,15 @@ if __name__ == '__main__':
     # std_model_stu.get_Ai(8)
 
     ## X
-    # std_model_stu.get_X()
+    X = std_model_stu.get_X(es=True)
+    print(f"X, {X.shape}")
+    print(X)
+    indices_1 = np.where(X == 1)
+    print("输入端口 ", list(zip(indices_1[0], indices_1[1]+1)))
 
     # # ## Y
-    # std_model_stu.get_Y()
+    Y = std_model_stu.get_Y()
+    # print(f"Y {Y.shape}")
 
     # # ## H
     # # std_model_stu.get_Hi(1), std_model_stu.get_Hi(2), std_model_stu.get_Hi(3), std_model_stu.get_Hi(4)
@@ -296,16 +311,24 @@ if __name__ == '__main__':
     # std_model_stu.get_Zi(5,es=True), std_model_stu.get_Zi(6,es=True), std_model_stu.get_Zi(7,es=True)
     # # std_model_stu.get_Zi(8)
 
-    std_model_stu.get_Z(es=False)
-    std_model_stu.get_Z(es=True)
+    Z = std_model_stu.get_Z(es=False)
+    Zs = std_model_stu.get_Z(es=True)
 
+    print(Z.shape)
+    print(Zs.shape)
 
 
     ## R Q
     # std_model_stu.get_R()
     std_model_stu.get_Q(es=False)
     std_model_stu.get_Q(es=True)
-    # std_model_stu.get_QBF()
-    # std_model_stu.get_YBF()
+
+    QB, QF = std_model_stu.get_QBF(es=True)
+    print(f"QB {QB.shape}")
+    print(QF.shape)
+
+    YB, YF = std_model_stu.get_YBF()
+    print(YB.shape)
+    print(YF.shape)
 
 
